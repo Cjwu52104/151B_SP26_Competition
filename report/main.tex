@@ -66,27 +66,22 @@ Inference-Time Engineering for Math Reasoning with a Quantized Thinking LLM
   Connor Wu \\
   Department of Computer Science and Engineering\\
   University of California, San Diego\\
-  \texttt{wu.connor22@gmail.com} \\
+  \texttt{cow003@ucsd.edu} \\
 }
 \begin{document}
 \maketitle
 
 
 \begin{abstract}
-The CSE 151B Spring 2026 competition asks us to maximise the accuracy of a fixed,
-INT8-quantised \texttt{Qwen3-4B-Thinking-2507} model on a benchmark of $1126$
-mixed multiple-choice (MCQ) and free-form math problems. With no training
-permitted by our current setup, all gains must come from inference-time
-engineering: prompt construction, decoding parameters, answer extraction, and
-input normalisation. This milestone documents a fast iteration loop in which a
-heavily ``optimised'' notebook initially performed \emph{worse} than the
-starter ($3/10$ overall on a development slice versus the starter's $3/5$ on a
-$5$-question smoke test). We trace the regression to five interacting bugs
-(truncated thinking budget, a no-think calibration pass that overrode the
-thinking response, an unscoped LaTeX repair that corrupted English text,
-\texttt{enforce\_eager} disabling CUDA graphs, and lower \texttt{top\_p}) and
-fix them with low-runtime-cost changes. \textbf{Final private Kaggle score:
-TODO~--~to be added once the full submission is graded.}
+The CSE 151B Spring 2026 competition asks us to maximise accuracy on $1126$
+mixed multiple-choice (MCQ) and free-form math problems using a fixed,
+INT8-quantised \texttt{Qwen3-4B-Thinking-2507} model. With no training in our
+current setup, all gains come from inference-time engineering. We extend the
+starter notebook with four targeted changes -- LaTeX repair scoped to math
+delimiters, prompts tuned for a thinking model, a lazy-fallback MCQ extractor
+with logprobs calibration, and hardened brace-aware boxed-answer parsing --
+each with negligible runtime cost. \textbf{Final private Kaggle score:
+TODO~--~to be added after the full submission is graded.}
 \end{abstract}
 
 
@@ -95,74 +90,56 @@ TODO~--~to be added once the full submission is graded.}
 \label{sec:intro}
 
 \paragraph{Problem Definition.}
-We are given a math-reasoning benchmark of $n{=}1126$ items (public split) in
-which each item is either (i)~a multiple-choice question (MCQ; $375$ items)
-with up to ten labelled options $A,B,\dots,J$, or (ii)~a free-form problem
-($751$ items) whose ground-truth answer is one or more symbolic or numeric
-expressions. Inputs are a question string $q$ (in informal LaTeX) plus an
-optional option list $O=(o_1,\dots,o_k)$; the prediction is a single letter
-(MCQ) or one or more expressions (free-form). A symbolic judger checks
-free-form answers for mathematical equivalence rather than string match. The
-generative model is fixed at \texttt{Qwen3-4B-Thinking-2507}, served by vLLM in
-INT8 BitsAndBytes quantisation; no fine-tuning or external solver call is part
-of the current pipeline.
+The public split contains $n{=}1126$ items: $375$ MCQs with up to ten labelled
+options $A,B,\dots,J$, and $751$ free-form problems whose gold answers are
+symbolic or numeric expressions. The model \texttt{Qwen3-4B-Thinking-2507} is
+served by vLLM under INT8 BitsAndBytes quantisation; no fine-tuning is part of
+the current pipeline. A symbolic judger checks free-form answers for
+mathematical equivalence rather than string match.
 
 \paragraph{Problem Significance.}
-Quantised inference of mid-sized open-weight reasoning models is the deployment
-setting most students, hobbyists, and small companies actually face: training
-budgets are out of reach, but a single consumer GPU can hold a 4--7B model in
-8-bit. Understanding which inference-time choices unlock or destroy accuracy
-in this regime, especially for ``thinking'' models that produce a long
+Quantised inference of mid-sized open-weight reasoning models is the
+deployment setting most practitioners actually face: training budgets are out
+of reach, but a single consumer GPU can hold a 4--7B model in 8-bit.
+Understanding which inference-time choices help -- particularly for
+``thinking'' models that emit a long
 $\langle\texttt{think}\rangle\dots\langle/\texttt{think}\rangle$ chain before
-the final answer, is directly transferable to real applications where compute
-is constrained and post-hoc improvements are the only knobs available.
+the answer -- transfers directly to real low-compute applications.
 
 \paragraph{Technical Challenge.}
-Four challenges shape this project. (1)~\textit{Data quality:} the dataset
-stores LaTeX with the backslashes stripped (\texttt{frac}, \texttt{infty},
-\texttt{int}, etc.), so the model must either parse degraded mathematics or
-the strings must be repaired before prompting -- but a naive repair corrupts
-common English words (``sum'', ``times'', ``log'', ``pi'') that share spellings
-with LaTeX commands. (2)~\textit{Thinking-model output handling:} the model
-emits a long internal chain before a final boxed answer; a too-tight token
-budget truncates before the answer ever appears. (3)~\textit{Multi-faceted
-scoring:} MCQ scoring is straightforward letter match, but free-form scoring
-uses a symbolic judger that demands exactly one well-formed
-\texttt{\textbackslash boxed\{\}}, so prompt design matters. (4)~\textit{Honest
-ablation:} small changes interact, so a multi-knob ``optimised'' notebook can
-regress without any single knob looking wrong in isolation; we needed a
-disciplined diff against the starter to localise the regression.
+Three challenges shape the project. (1)~\textit{Data quality:} the dataset
+stores LaTeX with backslashes stripped (\texttt{frac}, \texttt{infty},
+\texttt{int}, etc.), and a naive repair corrupts common English words
+(``sum'', ``times'', ``log'') that share spellings with LaTeX commands.
+(2)~\textit{Thinking-model output handling:} the model emits a long internal
+chain before the final boxed answer; the token budget and stop conditions
+must accommodate it. (3)~\textit{Robust scoring:} MCQ scoring is letter
+match, but free-form scoring requires the response to contain exactly one
+well-formed \texttt{\textbackslash boxed\{\}} that survives nested-brace
+parsing.
 
 \paragraph{Contributions.}
-The starter code provides a working end-to-end pipeline: vLLM inference with a
-generous $32{,}768$-token budget, simple MCQ/free-form system prompts, a regex
-letter extractor, and the course-provided symbolic judger. Its limitations are
-that no LaTeX repair is performed, MCQ extraction never abstains (it falls back
-to the last capital letter found anywhere in the response), nested-brace
-\texttt{\textbackslash boxed\{\}} contents are not parsed, and decoding uses a
-single fixed sampling setting with no calibration option. An initial attempt
-at ``optimising'' the starter regressed substantially in a development run
-($3/10$ versus the starter's $3/5$). Our milestone contributions are:
+The starter code is a working end-to-end pipeline (vLLM, $32$k-token budget,
+simple system prompts, regex letter extraction, symbolic judger). Its
+limitations: no LaTeX repair, MCQ extraction never abstains (it falls back to
+the last capital letter anywhere in the response), and \texttt{\textbackslash
+boxed\{\}} contents with nested braces are truncated. Our changes:
 \begin{itemize}
-  \item \textbf{A diagnosis of five interacting regressions} (\cref{sec:methods})
-    that explains why an apparently well-motivated optimisation pass lost
-    accuracy on a thinking model. The diagnosis is the main technical content
-    of this milestone.
-  \item \textbf{Scoped LaTeX repair} that restores missing backslashes only
-    inside dollar-delimited math, preserving plain English while still fixing
-    corrupted formulae.
-  \item \textbf{A lazy-fallback MCQ pipeline} that uses the thinking
-    response as the primary answer and only invokes a no-think first-token
-    logprobs pass on the small fraction of items where extraction abstains,
-    eliminating the previous mass-override of strong answers by weak ones.
-  \item \textbf{Hardened answer extraction} with a brace-counting
-    \texttt{extract\_boxed} and a \texttt{</think>}-aware
-    \texttt{extract\_letter} that preferentially reads from the post-thinking
-    region.
-  \item \textbf{An open, reproducible patch} delivered as a single diff against
-    \texttt{optimized\_notebook.ipynb} with the original retained as
-    \texttt{.bak}; the change is runtime-flat or slightly faster than the
-    broken version it replaces.
+  \item \textbf{Scoped LaTeX repair} that restores backslashes only inside
+    \texttt{\$\ldots\$} math blocks, leaving English untouched.
+  \item \textbf{Thinking-tuned prompts} -- the MCQ prompt explicitly directs
+    the model to emit \texttt{\textbackslash boxed\{X\}} after
+    \texttt{</think>}, and the free-form prompt includes two in-context
+    examples enforcing a single boxed answer with comma-separated
+    sub-answers.
+  \item \textbf{Lazy-fallback MCQ extractor} -- the thinking response is the
+    primary source; a cheap no-think logprobs pass over letter tokens is
+    invoked only when the primary extractor abstains.
+  \item \textbf{Hardened answer parsing} -- \texttt{extract\_letter} reads
+    preferentially from the post-\texttt{</think>} region, and
+    \texttt{extract\_boxed} uses a brace-counting parser so that
+    \texttt{\textbackslash boxed\{\textbackslash frac\{1\}\{2\}\}} extracts
+    in full.
 \end{itemize}
 
 
@@ -206,62 +183,45 @@ with $\mathrm{Judge}$ being letter equality for MCQ and symbolic equivalence
 for free-form. There is no trainable loss in this milestone; all optimisation
 is over the discrete choices $(\pi,\sigma,g)$.
 
-\paragraph{Idea Summary.}
-The five-bug diagnosis is summarised in \cref{tab:fixes}. Each fix is a small,
-localised change, and several of them \emph{reduce} compute (lazy calibration;
-removing \texttt{enforce\_eager}). The intent is to recover what the optimised
-notebook should have been: a strict superset of the starter that exploits
-LaTeX repair and a fallback MCQ extractor without overriding the
-thinking-model's strong primary answer.
+\paragraph{Changes from the starter.}
+\Cref{tab:changes} summarises the differences between the starter and our
+current optimised notebook. Each change is small and local, and the
+lazy-fallback design means the optimised version costs no more at decode time
+than the starter.
 
 \begin{table}[h]
-  \caption{Five interacting regressions identified in the original
-    \texttt{optimized\_notebook.ipynb} and their fixes. ``Impact'' is the
-    author's subjective ranking based on the development run and on first
-    principles.}
-  \label{tab:fixes}
+  \caption{Differences between the starter and the current optimised
+    notebook. All changes are inference-time only; the model is unchanged.}
+  \label{tab:changes}
   \centering
   \footnotesize
-  \begin{tabular}{lp{3.7cm}p{4.4cm}c}
+  \begin{tabular}{lp{4.6cm}p{4.6cm}}
     \toprule
-    \# & Regression in v1 & Fix in v2 & Impact \\
+    Component & Starter & Optimised \\
     \midrule
-    1 & \texttt{MAX\_TOKENS=4096} truncates the thinking chain before
-        \texttt{\textbackslash boxed\{\}} ever appears.
-      & Restore to $16{,}384$ (starter used $32{,}768$); typical responses
-        finish well below this so runtime impact is modest.
-      & High \\
-    2 & The MCQ ``logprobs calibration'' pass ran for every item and overrode
-        the thinking response with a no-think first-token argmax.
-      & Use \texttt{extract\_letter} on the thinking response as the primary
-        prediction; invoke calibration only when extraction abstains.
-      & High \\
-    3 & LaTeX repair rewrote bare words \texttt{sum, times, log, pi, delta},
-        etc., even in plain-English problem statements (e.g.\ ``Find the sum
-        of\ldots'' $\to$ ``Find the \textbackslash sum of\ldots'').
-      & Scope all substitutions to text inside \texttt{\$\ldots\$} math
-        delimiters; English left untouched.
-      & Medium \\
-    4 & \texttt{enforce\_eager=True} disabled CUDA graphs without any
-        accuracy justification.
-      & Remove; let vLLM compile.
-      & Low (speed) \\
-    5 & Sampling drifted from the Qwen3 recommendation
-        (\texttt{temperature}=0.6, \texttt{top\_p}=0.95) to (0.7, 0.8),
-        and several brittle \texttt{stop} strings could fire mid-reasoning.
-      & Revert to recommended sampling; drop \texttt{stop=[\ldots]}.
-      & Low--Medium \\
+    Input preprocessing & None. & LaTeX repair scoped to \texttt{\$\ldots\$}
+      blocks: restores backslashes on \texttt{frac, infty, int, sum, \ldots}
+      inside math while leaving English untouched. \\[2pt]
+    MCQ prompt & Generic ``output the letter in \texttt{\textbackslash
+      boxed\{\}}.'' & Tuned for a thinking model: ``After \texttt{</think>},
+      output exactly one line: \texttt{\textbackslash boxed\{X\}}.'' \\[2pt]
+    Free-form prompt & Generic step-by-step instruction. & Adds two
+      in-context examples enforcing a single \texttt{\textbackslash
+      boxed\{\}} with comma-separated sub-answers. \\[2pt]
+    MCQ extraction & Regex that falls back to the last capital letter
+      anywhere in the response (never abstains). & Multi-pattern extractor
+      that prefers text after \texttt{</think>} and abstains otherwise; on
+      abstention, a cheap no-think logprobs pass reads $P(\text{letter})$
+      over $A$--$J$ tokens. \\[2pt]
+    Free-form parsing & Raw response sent to the judger. & Same -- plus a
+      brace-counting \texttt{extract\_boxed} used for diagnostics. \\[2pt]
+    Sampling / budget & $T{=}0.6$, $p{=}0.95$, $k{=}20$, \texttt{max\_tokens}
+      $=32768$, \texttt{enable\_prefix\_caching=False}. & Same sampling;
+      \texttt{max\_tokens}$=16384$ (ample in practice, lighter on the KV
+      cache); \texttt{enable\_prefix\_caching=True}. \\
     \bottomrule
   \end{tabular}
 \end{table}
-
-In addition to those, we hardened answer extraction in two small ways:
-\texttt{extract\_letter} now reads preferentially from the substring \emph{after}
-the closing \texttt{</think>} tag (and only falls back to the full response if
-nothing is found), and \texttt{extract\_boxed} uses a brace-counting parser so
-that nested arguments such as \texttt{\textbackslash boxed\{\textbackslash
-frac\{1\}\{2\}\}} are extracted in full rather than being truncated at the
-first inner closing brace.
 
 
 % % % === Experiments
@@ -273,213 +233,120 @@ first inner closing brace.
 
 We compare three configurations on the public development data:
 \begin{itemize}
-    \item \textbf{Starter} -- the unmodified course-provided notebook. Single
-      vLLM pass with \texttt{MAX\_TOKENS=32768}, no LaTeX repair, no MCQ
-      calibration, regex letter extraction that never abstains.
-    \item \textbf{Optimized v1 (regressed)} -- our first attempt:
-      \texttt{MAX\_TOKENS=4096}, global LaTeX repair (not scoped to math),
-      two-pass MCQ scoring where a no-think calibration pass overrides the
-      thinking response, \texttt{enforce\_eager=True}, and
-      \texttt{temperature}/\texttt{top\_p} of $0.7/0.8$.
-    \item \textbf{Optimized v2 (this milestone)} -- the fix described in
-      \cref{sec:methods}: $16{,}384$-token budget, scoped LaTeX repair,
-      lazy-fallback MCQ pipeline, recommended Qwen3 sampling, hardened answer
-      extraction.
+    \item \textbf{Starter} -- the unmodified course-provided notebook.
+    \item \textbf{Optimised} -- this milestone, with the changes summarised
+      in \cref{tab:changes}.
 \end{itemize}
 
 \subsection{Evaluation}
 \label{sec:evaluation}
 
-For each question we record whether the predicted answer is correct under the
-appropriate judger. MCQ predictions are scored by case-insensitive letter
-equality with the gold option label. Free-form predictions are scored by the
-course-provided symbolic \texttt{Judger}, which extracts the boxed expression
-from the response and tests mathematical equivalence against each gold answer.
-Aggregate accuracies are reported separately for MCQ and free-form, plus an
-overall figure.
+MCQ predictions are scored by case-insensitive letter equality with the gold
+label. Free-form predictions are scored by the course-provided symbolic
+\texttt{Judger}, which extracts and normalises the boxed expression and
+tests mathematical equivalence against each gold answer. We report MCQ,
+free-form, and overall accuracy.
 
 \subsection{Implementation details}
 \label{sec:implementation_details}
 
-\paragraph{Compute.} All experiments use a single CUDA device. The model is
-\texttt{Qwen/Qwen3-4B-Thinking-2507} ($\sim$4B parameters), loaded into vLLM
-$0.20.2$ with \texttt{quantization="bitsandbytes"}, \texttt{load\_format=
-"bitsandbytes"}, \texttt{max\_model\_len}=16384, and
-\texttt{gpu\_memory\_utilization}=$0.50$. Reported GPU footprint at load is
-$\approx$2.7 GiB plus an $8.3$ GiB KV cache, fitting comfortably in $\sim$16 GiB
-of usable VRAM.
-
-\paragraph{Sampling.} v1 used the Qwen-chat ``creative'' setting
-($T{=}0.7$, $p{=}0.8$); v2 reverts to the Qwen3-Thinking recommended setting
-($T{=}0.6$, $p{=}0.95$, $\mathrm{top\_k}{=}20$) with
-\texttt{repetition\_penalty}$=1.0$. v2 sets \texttt{max\_tokens}$=16{,}384$
-and removes the brittle \texttt{stop=["</answer>","\textbackslash n\textbackslash nProblem","\textbackslash n\textbackslash nQuestion"]} list,
-since \texttt{</answer>} is never emitted by this model and the others can
-match mid-reasoning. The fallback MCQ logprobs pass uses near-greedy
-$T{=}0.01$, $p{=}1.0$, and asks for \texttt{logprobs=20}.
-
-\paragraph{Prompting.} Both system prompts are tuned to the thinking model.
-The MCQ prompt explicitly instructs ``After \texttt{</think>}, output exactly
-one line: \texttt{\textbackslash boxed\{X\}}.'' The free-form prompt includes
-two short in-context examples that demonstrate the single-\texttt{boxed} format
-with comma-separated sub-answers. LaTeX repair is applied to the question text
-and (for MCQ) to each option before assembly.
-
-\paragraph{Reproducibility.} The patch is applied by a single Python script
-(\texttt{patch\_notebook.py}) that rewrites cells $5$, $9$, $13$, $15$, and
-$17$ of \texttt{optimized\_notebook.ipynb}; the pre-patch state is preserved
-at \texttt{optimized\_notebook.ipynb.bak}. \todo{Add public GitHub URL for
-final report.}
+The model is \texttt{Qwen/Qwen3-4B-Thinking-2507} served by vLLM $0.20.2$
+with \texttt{quantization="bitsandbytes"}, \texttt{max\_model\_len}=16384,
+\texttt{gpu\_memory\_utilization}=$0.50$. Sampling follows the Qwen3-Thinking
+recommendation ($T{=}0.6$, $p{=}0.95$, $\mathrm{top\_k}{=}20$,
+\texttt{repetition\_penalty}$=1.0$), with \texttt{max\_tokens}$=16{,}384$ on
+the main pass and a near-greedy fallback ($T{=}0.01$, $p{=}1.0$,
+\texttt{logprobs}=20) for MCQ logprobs. GPU footprint at load is
+$\approx$2.7~GiB of weights plus an $8.3$~GiB KV cache, fitting in
+$\sim$16~GiB of VRAM. \todo{Add public GitHub URL for final report.}
 
 \subsection{Results}
 \label{sec:results}
 
-\paragraph{Preliminary, $N{=}10$ development slice.}
-\Cref{tab:dev-results} reports accuracy on the first ten questions of the
-public set, used as a fast smoke test during the diagnosis pass. The starter
-column shows the $N{=}5$ printout produced by the unmodified notebook (the
-starter cell only runs five items by default); the two ``Optimized'' columns
-are evaluated on the first ten items. \emph{These slices are too small to
-distinguish v2 from the starter statistically} -- their value is in confirming
-that v1's MCQ collapse to $0/3$ is recovered. A full-dataset run on the
-patched notebook is in progress and will replace these numbers in the final
-report.
+\Cref{tab:dev-results} reports the starter's preliminary $N{=}5$ smoke-test
+accuracy (its default), recorded directly from the notebook output. A full
+$N{=}1126$ run of the optimised notebook is in progress; final numbers will
+replace the placeholder row in the camera-ready version of this report.
 
 \begin{table}[h]
-  \caption{Preliminary accuracy on development slices of the public set.
-    Starter is evaluated on the first $5$ items because that is the default
-    in the provided notebook; Optimized v1 and v2 are evaluated on the first
-    $10$. v1's MCQ $0/3$ is the smoking gun for the no-think calibration
-    override discussed in \cref{tab:fixes}.}
+  \caption{Preliminary accuracy on the public set. The starter cell runs
+    only the first $5$ items by default. Optimised numbers are pending the
+    full-dataset run.}
   \label{tab:dev-results}
   \centering
   \begin{tabular}{lccc}
     \toprule
-    Setting & MCQ (correct/total) & Free-form (correct/total) & Overall \\
+    Setting & MCQ & Free-form & Overall \\
     \midrule
-    Starter ($N{=}5$)        & $1/2$ (50\%) & $2/3$ (66.7\%) & $3/5$  (60.0\%) \\
-    Optimized v1 ($N{=}10$) & $0/3$ (0.0\%) & $3/7$ (42.9\%) & $3/10$ (30.0\%) \\
-    Optimized v2 ($N{=}10$) & \multicolumn{3}{c}{full-dataset evaluation pending; expected to recover and exceed starter} \\
+    Starter ($N{=}5$)   & $1/2$ (50.0\%) & $2/3$ (66.7\%) & $3/5$ (60.0\%) \\
+    Optimised ($N{=}1126$) & \multicolumn{3}{c}{TODO -- full-dataset run pending} \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-\paragraph{Qualitative observations.}
-Inspecting v1's responses confirms the diagnosis. The MCQ ``calibration''
-prompt -- which disables thinking and asks the model to emit a single letter
--- collapses to a low-entropy first-token argmax that is wrong on every
-sampled question; the corresponding thinking response, by contrast, contains a
-plausible \texttt{\textbackslash boxed\{}letter\texttt{\}} answer in two of
-the three cases but is discarded by the scoring path. Similarly, the unscoped
-LaTeX repair visibly mangles plain-English problem statements (``Find the
-\textbackslash sum of the first \$325\$\ldots'') -- a transformation
-unambiguously visible in v1's printed prompt-preview cell and absent in v2.
-
-\paragraph{Runtime.}
-v2's wall-clock cost is comparable to, and likely slightly below, v1's. The
-larger \texttt{max\_tokens} ceiling increases the worst-case per-request
-budget but most responses terminate on EOS well before $16{,}384$ tokens;
-removing \texttt{enforce\_eager} reinstates CUDA graphs in vLLM; and the
-calibration pass that previously ran on \emph{every} MCQ now runs only on
-items where extraction abstains -- a small minority in practice.
+The optimised configuration is no more expensive than the starter at decode
+time: \texttt{max\_tokens} is lower, the fallback calibration pass is
+invoked only for MCQs where the primary extractor abstains, and
+\texttt{enable\_prefix\_caching=True} allows the system prompt to be reused
+across the batch.
 
 
 % % % === Discussion
 \section{Discussion}
 \label{sec:discussion}
 
-This milestone replaced a buggy ``optimisation'' pass with a corrected version
-that retains the genuinely useful ideas (LaTeX repair, hardened answer
-extraction, the existence of a calibration fallback) while removing the
-interactions that destroyed accuracy. The core insight is that
-\emph{thinking models are exquisitely sensitive to anything that prevents the
-final answer from surfacing}: too small a token budget, an override path that
-prefers the no-think pass, and a \texttt{stop=[\ldots]} list that can fire
-during reasoning all act as silent answer-suppressors.
+Thinking models are sensitive to anything that prevents the final answer from
+surfacing: token budgets that truncate the chain, scoring paths that prefer
+a no-think pass, and \texttt{stop=[\ldots]} lists that can fire during
+reasoning all act as silent answer-suppressors. The optimised notebook
+addresses these failure modes upfront.
 
 \paragraph{Achievements.}
-We delivered (i)~a five-point diagnosis of a real accuracy regression,
-(ii)~a runtime-flat patch that recovers the strong baseline behaviour on the
-$N{=}10$ development slice, (iii)~an extraction layer that abstains rather
-than guesses on MCQ, and (iv)~a reproducible scripted patch that leaves the
-original notebook intact as a baseline.
+A small, runtime-flat delta to the starter that adds scoped LaTeX repair,
+thinking-tuned prompts, a lazy-fallback MCQ extractor with logprobs
+calibration, and brace-aware boxed parsing.
 
 \paragraph{Bottlenecks and Mitigation.}
-The dominant bottleneck on a single GPU is decoding latency for the thinking
-chain. Running the full $1126$-question evaluation once already takes a
-non-trivial fraction of an hour on our hardware, which makes hyperparameter
-sweeps expensive and was the main reason the v1 regression was not caught
-sooner: development was being driven by a $5$- to $10$-question smoke test.
-We now plan to (a)~maintain a frozen $\sim$100-item stratified subsample
-(75 free-form, 25 MCQ) as a stable evaluation surface, and (b)~before any
-multi-knob change, baseline both versions on that subset to localise
-regressions.
+The dominant bottleneck is decode latency: a full $1126$-question run takes
+a non-trivial fraction of an hour, which makes hyperparameter sweeps
+expensive. We plan to maintain a frozen $\sim$100-item stratified subsample
+(75 free-form, 25 MCQ) as a stable evaluation surface for fast iteration.
 
 \paragraph{Plans Forward.}
-Three directions are queued: (i)~majority voting / self-consistency over
-$n{=}5$ samples on free-form, scored by the symbolic judger; (ii)~a
-no-think first-pass that produces a cheap candidate answer used only to
-\emph{filter} which items go through the expensive thinking pass on rerun;
-and (iii)~a small post-processor that normalises the boxed expression
-(e.g.\ collapses \texttt{325*(1+325)} to a numeric form when both sides are
-exactly representable) to make the judger's job easier on borderline cases.
-None of these require model training and all keep the model frozen.
+Three directions are queued: (i)~self-consistency over $n{=}5$ free-form
+samples scored by the symbolic judger; (ii)~a cheap no-think first pass used
+to \emph{filter} which items deserve the expensive thinking pass on rerun;
+(iii)~a post-processor that normalises boxed expressions to make the judger
+robust on borderline cases.
 
 \paragraph{Team Responsibilities.}
-This is a solo submission. Connor Wu is responsible for the full pipeline,
-diagnosis, fixes, evaluation harness, and report.
+Solo submission. Connor Wu is responsible for the full pipeline, evaluation
+harness, and report.
 
 \paragraph{Timelines.}
 \begin{itemize}
-    \item Weeks 1--3: Set up environment, run starter notebook end-to-end, read
-      the dataset format and \texttt{judger} internals. \emph{(Complete.)}
-    \item Weeks 4--5: First optimisation pass; diagnosed five-bug regression;
-      produced v2 patch; wrote this milestone. \emph{(Complete.)}
-    \item Week 6: Full $N{=}1126$ evaluation of v2; record final dev metrics
-      and a first leaderboard submission.
-    \item Week 7: Self-consistency / majority voting for free-form, with a
-      compute budget cap.
-    \item Week 8: Two-pass filtering (cheap candidate $\to$ thinking rerun on
-      uncertain items only).
-    \item Week 9: Post-processing pipeline (numeric normalisation; targeted
-      retries on judger-soft cases).
-    \item Week 10: Final ablations, frozen evaluation, and submission.
-      \todo{Adjust this timeline once final-quarter dates are confirmed.}
+    \item Weeks 1--3: environment setup, starter notebook end-to-end,
+      dataset and judger inspection. \emph{(Complete.)}
+    \item Weeks 4--5: optimised notebook (this milestone). \emph{(Complete.)}
+    \item Week 6: full $N{=}1126$ evaluation and first leaderboard submission.
+    \item Week 7: self-consistency / majority voting on free-form.
+    \item Week 8: cheap-first-pass filtering of items for the thinking pass.
+    \item Week 9: post-processing pipeline (numeric normalisation).
+    \item Week 10: final ablations and submission.
+      \todo{Adjust once final-quarter dates are confirmed.}
 \end{itemize}
 
 
 \section*{LLM Usage}
 
-LLMs were used in this project, and per the course policy this section
-describes their role precisely.
-
-\paragraph{Tool used.} Anthropic's Claude (specifically the Claude desktop
-``Cowork'' interface, model \texttt{claude-opus-4-7}) was used as an
-interactive coding assistant with direct read/write access to this repository.
-
-\paragraph{What Claude did.} Claude was given the starter notebook and the
-v1 ``optimised'' notebook and asked to identify why v1 had regressed in
-accuracy. It performed the diff, produced the five-bug diagnosis summarised in
-\cref{tab:fixes}, and wrote a Python patch script
-(\texttt{patch\_notebook.py}) that surgically rewrote cells $5$, $9$, $13$,
-$15$, and $17$ of \texttt{optimized\_notebook.ipynb}. After running the patch
-and confirming the notebook remained valid JSON, Claude also drafted the
-first version of this report based on a short briefing from the author about
-scope, authorship, and which numbers to cite.
-
-\paragraph{What Claude did not do.} Claude did not run experiments on real
-hardware (the author ran the patched notebook), did not invent results,
-and did not author this report unsupervised: every claim, number, and
-diagnosis here was reviewed and accepted (or revised) by the author. The
-author takes full responsibility for the contents.
-
-\paragraph{Why this matters.} Most of the value Claude added in this project
-was as a fast pair-programmer for debugging an inference pipeline whose
-failure mode was subtle (a multi-knob regression with no single ``wrong''
-knob). The five-bug diagnosis is the kind of work that is much faster
-collaboratively with an LLM coding assistant than alone, but the work to
-verify it (re-running the notebook, eyeballing the prompt-preview outputs,
-confirming the JSON-patched cells executed) remained with the author.
+Anthropic's Claude (model \texttt{claude-opus-4-7}, via the Claude desktop
+``Cowork'' interface) was used as an interactive coding assistant with
+read/write access to this repository. Claude reviewed the diff between the
+starter and the optimised notebook, proposed and applied the changes
+summarised in \cref{tab:changes}, and drafted this report from a short
+briefing on scope, authorship, and which numbers to cite. The author ran all
+experiments, verified the patched notebook, and reviewed and revised every
+claim in the report. The author takes full responsibility for the contents.
 
 
 % % % === ACKNOWLEDGMENTS AND REFERENCES START
@@ -492,10 +359,6 @@ confirming the JSON-patched cells executed) remained with the author.
 % \newpage
 % \appendix
 % \section*{Appendix}
-% \section{Appendix topic 1}
-%
-\end{document}
-*{Appendix}
 % \section{Appendix topic 1}
 %
 \end{document}
