@@ -229,10 +229,9 @@ def run_inference(
 
     llm = LLM(
         model=model_id,
-        quantization="bitsandbytes",
-        load_format="bitsandbytes",
+        dtype="bfloat16",
         enable_prefix_caching=True,
-        gpu_memory_utilization=0.50,
+        gpu_memory_utilization=0.90,
         max_model_len=max_tokens,
         trust_remote_code=True,
         max_num_seqs=64,
