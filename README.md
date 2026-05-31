@@ -2,10 +2,10 @@
 
 ## GPU & Inference Time
 
-| Item | Detail |
-|---|---|
-| GPU | NVIDIA A100 80 GB (single GPU) |
-| Approximate total inference time | ~45–60 minutes for the full private set |
+| Item                             | Detail                              |
+| -------------------------------- | ----------------------------------- |
+| GPU                              | NVIDIA A30                          |
+| Approximate total inference time | ~4-6 hours for the full private set |
 
 ## Model Weights
 
@@ -64,10 +64,10 @@ run_inference(
 
 ## Repository Contents
 
-| File | Description |
-|---|---|
-| `run_inference.py` | Single entry point — call `run_inference()` to reproduce results |
-| `judger.py` | Response scoring logic |
-| `utils.py` | Utilities used by `judger.py` |
-| `data/public.jsonl` | Public dataset with ground-truth answers |
-| `results/` | Output CSV files written at runtime |
+| File                | Description                                                      |
+| ------------------- | ---------------------------------------------------------------- |
+| `run_inference.py`  | Single entry point — call `run_inference()` to reproduce results |
+| `judger.py`         | Response scoring logic                                           |
+| `utils.py`          | Utilities used by `judger.py`                                    |
+| `data/public.jsonl` | Public dataset with ground-truth answers                         |
+| `results/`          | Output CSV files written at runtime                              |
