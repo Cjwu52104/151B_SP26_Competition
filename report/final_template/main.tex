@@ -1,0 +1,535 @@
+% =======> Project Final Report for CSE 151B Spring 2026 Math Reasoning Competition
+% Authors: Connor Wu
+% =================================================
+
+\documentclass{article}
+
+\PassOptionsToPackage{numbers, compress}{natbib}
+
+\usepackage[preprint]{neurips_2024}
+
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage{float}
+\DeclareMathOperator{\R}{\mathbb{R}}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{hyperref}
+\usepackage{wrapfig}
+\usepackage[capitalize,noabbrev]{cleveref}
+\RequirePackage{doi}
+\usepackage{xcolor, colortbl}
+\definecolor{darkblue}{rgb}{0.19, 0.19, 0.62}
+\hypersetup{
+  colorlinks = true,
+  citecolor  = darkblue,
+  filecolor  = darkblue,
+  urlcolor   = darkblue,
+}
+\usepackage[textsize=tiny]{todonotes}
+
+
+\title{
+CSE 151B/251B Final Report:\\
+Inference-Time Engineering for Math Reasoning\\
+with a Thinking Language Model
+}
+
+\author{%
+  Connor Wu \\
+  Department of Computer Science and Engineering\\
+  University of California, San Diego\\
+  \texttt{cow003@ucsd.edu} \\
+}
+\begin{document}
+\maketitle
+
+
+\begin{abstract}
+The CSE 151B Spring 2026 competition tasks participants with maximising
+accuracy on a mixed set of multiple-choice (MCQ) and free-form math problems
+using a fixed open-weight reasoning model.
+With no fine-tuning, all gains come from inference-time engineering.
+We extend the starter notebook with five targeted changes:
+(i)~BFloat16 full-precision serving instead of INT8 quantisation,
+(ii)~scoped LaTeX repair inside \texttt{\$\ldots\$} delimiters only,
+(iii)~structured six-step and five-step system prompts tuned for a thinking
+model's \texttt{<think>/</think>} output format,
+(iv)~a lazy-fallback MCQ extractor that invokes a cheap logprobs pass only
+when the primary extractor abstains, and
+(v)~brace-aware boxed-answer parsing.
+These changes achieve a \textbf{final private leaderboard score of 0.615}
+(\textbf{rank 37 out of 105 teams}, top 35\%).
+Code: \url{https://github.com/Cjwu52104/151B_SP26_Competition}.
+\end{abstract}
+
+
+% % % === Introduction
+\section{Introduction}
+\label{sec:intro}
+
+\paragraph{Problem Definition.}
+The competition dataset contains $1{,}116$ problems partitioned into two
+types: 375 multiple-choice questions (MCQ) each accompanied by up to ten
+labelled options $A,B,\dots,J$, and 741 free-form problems whose gold answers
+are symbolic or numeric expressions.
+We are given a fixed model,
+\texttt{Qwen3-4B-Thinking-2507}~\citep{qwen3}, and must produce an answer
+for every question.
+Predictions are submitted as a CSV; MCQ answers are scored by case-insensitive
+letter equality and free-form answers by symbolic equivalence via a SymPy-based
+judger.
+No fine-tuning, retrieval, or external APIs are permitted at inference time.
+
+\paragraph{Problem Significance.}
+Automated mathematical reasoning is a core challenge for AI systems with
+high-stakes applications in education, scientific computing, and software
+verification.
+Mid-size open-weight reasoning models running on a single consumer or
+workstation GPU represent the most accessible deployment setting for students
+and independent researchers.
+Understanding which inference-time choices reliably improve accuracy —
+particularly for ``thinking'' models that emit a long internal chain of thought
+before their final answer — transfers directly to real low-compute
+applications.
+
+\paragraph{Technical Challenge.}
+Three challenges shaped this project.
+(1)~\textit{Corrupted input:} the dataset stores LaTeX with backslashes
+stripped (\texttt{frac}, \texttt{infty}, \texttt{int}, etc.), and a naive
+global repair corrupts common English words (``sum'', ``log'') that share
+spellings with LaTeX commands.
+(2)~\textit{Thinking-model output handling:} the model emits a long
+\texttt{<think>}\ldots\texttt{</think>} internal monologue before its final
+answer; the token budget and stop conditions must accommodate the full chain
+without truncating it.
+(3)~\textit{Robust answer extraction:} MCQ scoring requires a single letter
+from a \texttt{\textbackslash boxed\{\}} expression, and free-form scoring
+requires the response to contain exactly one well-formed
+\texttt{\textbackslash boxed\{\}} whose content survives nested-brace parsing.
+
+\paragraph{Contributions.}
+The starter code is a working end-to-end pipeline (vLLM, 32k-token budget,
+generic system prompts, regex letter extraction, symbolic judger).
+Its limitations include:
+no LaTeX repair,
+INT8 quantisation that reduces effective precision,
+MCQ extraction that never abstains (falls back to the last capital letter
+anywhere in the response),
+and truncation of nested \texttt{\textbackslash boxed\{\}} contents.
+Our final solution addresses each limitation:
+
+\begin{itemize}
+  \item \textbf{BFloat16 full-precision serving.} Removing INT8 quantisation
+    and serving in BF16 on a 24~GiB NVIDIA A30 eliminates weight rounding
+    errors that can silently alter numerical answers.
+
+  \item \textbf{Scoped LaTeX repair.} Backslashes are restored only inside
+    \texttt{\$\ldots\$} math blocks using 35 pattern--replacement pairs,
+    leaving prose untouched.
+
+  \item \textbf{Structured thinking-tuned prompts.} The MCQ prompt directs the
+    model through six explicit reasoning steps (Classify, Setup, Solve, Match,
+    Eliminate, Confirm) and ends with a strict post-\texttt{</think>}
+    instruction to emit exactly \texttt{\textbackslash boxed\{X\}}.
+    The free-form prompt uses five steps (Count, Plan, Solve, Verify, Collect)
+    and enforces a single comma-separated \texttt{\textbackslash boxed\{\}}.
+
+  \item \textbf{Lazy-fallback MCQ extractor.} The thinking response is the
+    primary source.  A cheap no-think logprobs pass over letter tokens $A$--$J$
+    is invoked only when the primary extractor abstains, avoiding extra latency
+    on the majority of questions.
+
+  \item \textbf{Hardened answer parsing.} \texttt{extract\_letter} reads
+    preferentially from the post-\texttt{</think>} region; letter-option
+    markers (\texttt{A)}, \texttt{B.}) are used as a last resort.
+\end{itemize}
+
+
+% % % === Related Work
+\section{Related Work}
+\label{sec:relatedwork}
+
+\paragraph{Reasoning LLMs.}
+Recent open-weight ``thinking'' models such as the Qwen3
+series~\citep{qwen3} interleave a hidden chain of thought delimited by
+\texttt{<think>/</think>} with a final user-facing answer.
+Their accuracy on math benchmarks improves with an adequate decoding budget
+and sampling temperatures in the range recommended by the model authors
+($T{=}0.6$, $p{=}0.95$, $k{=}20$).
+Thinking models are sensitive to system-prompt wording: prompts that do
+not explicitly instruct the model on post-think output format often elicit
+verbose prose rather than a clean \texttt{\textbackslash boxed\{\}},
+breaking downstream extraction.
+
+\paragraph{Inference serving.}
+vLLM~\citep{vllm} provides batched, paged-attention serving of HuggingFace
+models with BitsAndBytes INT8 and BFloat16 precision modes.
+Prefix caching (\texttt{enable\_prefix\_caching=True}) amortises the cost of
+a shared system prompt across all questions in the batch, reducing
+time-to-first-token for long prompts.
+
+\paragraph{Symbolic answer judging.}
+Math benchmarks such as MATH~\citep{hendrycks2021math} have driven the
+development of symbolic equivalence checkers built on CAS backends.
+The course-provided \texttt{Judger} class follows this lineage: it extracts
+the content of \texttt{\textbackslash boxed\{\}} and tests mathematical
+equivalence against each gold answer, tolerating equivalent forms such as
+simplified fractions and expanded polynomials.
+
+
+% % % === Methods
+\section{Methods}
+\label{sec:methods}
+
+\paragraph{Problem Setting.}
+Let $\mathcal{D}=\{(q_i,O_i,y_i)\}_{i=1}^{n}$ be the evaluation set, where
+$q_i$ is the question text, $O_i$ is the (possibly empty) list of MCQ options,
+and $y_i$ is the gold answer.
+The model $f_\theta$ is held fixed.  We choose a prompt template $\pi$,
+sampling parameters $\sigma$, and extraction function $g$ to maximise
+\[
+  \mathrm{Acc}(\pi,\sigma,g) \;=\; \tfrac{1}{n}\sum_{i=1}^{n}\,
+    \mathbf{1}\!\left[\mathrm{Judge}\bigl(g(f_\theta(\pi(q_i,O_i);\sigma))\bigr) = y_i\right],
+\]
+where $\mathrm{Judge}$ is letter equality for MCQ and symbolic equivalence for
+free-form.  Because $\theta$ is fixed, there is no trainable loss; all
+optimisation is over the discrete choices $(\pi,\sigma,g)$.
+
+\paragraph{Idea Summary.}
+The core insight is that a thinking model already ``knows'' the answer —
+its chain of thought is long and accurate — but failures arise at two
+boundaries: (1)~the input boundary, where stripped LaTeX makes problem
+statements ambiguous, and (2)~the output boundary, where imprecise prompts
+and fragile extraction discard correct reasoning.
+Targeting both boundaries with lightweight, zero-latency fixes is sufficient
+to improve accuracy without any training or ensemble cost.
+Alternative directions (self-consistency, SFT, GRPO) were queued but not
+pursued, since the output-boundary fixes alone moved the leaderboard score
+into the upper third.
+
+\paragraph{Method Description.}
+\Cref{tab:changes} summarises the differences between the starter code and
+our final optimised pipeline.
+
+\begin{table}[h]
+  \caption{Component-level comparison of the starter and the final optimised
+    pipeline. All changes are inference-time only; the model weights are
+    unchanged.}
+  \label{tab:changes}
+  \centering
+  \footnotesize
+  \begin{tabular}{lp{4.3cm}p{4.3cm}}
+    \toprule
+    Component & Starter & Final (Optimised) \\
+    \midrule
+    Quantisation &
+      INT8 via BitsAndBytes (\texttt{gpu\_memory\_utilization=0.50}). &
+      BFloat16 full precision (\texttt{gpu\_memory\_utilization=0.90},
+      NVIDIA A30 24~GiB). \\[3pt]
+    Input preprocessing &
+      None. &
+      Scoped LaTeX repair: restores backslashes on 35 commands
+      (\texttt{frac}, \texttt{sqrt}, \texttt{sin}, \texttt{pi}, \ldots)
+      inside \texttt{\$\ldots\$} blocks only. \\[3pt]
+    MCQ system prompt &
+      Generic: ``output the letter in \texttt{\textbackslash boxed\{\}}.'' &
+      Six-step structured: Classify $\to$ Setup $\to$ Solve $\to$ Match $\to$
+      Eliminate $\to$ Confirm; strict post-\texttt{</think>} format rule. \\[3pt]
+    Free-form system prompt &
+      Generic step-by-step instruction. &
+      Five-step structured: Count $\to$ Plan $\to$ Solve $\to$ Verify $\to$
+      Collect; single comma-separated \texttt{\textbackslash boxed\{\}} rule. \\[3pt]
+    MCQ extraction &
+      Regex falls back to the last capital letter anywhere in the response
+      (never abstains). &
+      Multi-pattern extractor prefers text after \texttt{</think>};
+      on abstention, a no-think logprobs pass reads $P(\text{letter})$
+      over $A$--$J$. \\[3pt]
+    Sampling / budget &
+      $T{=}0.6$, $p{=}0.95$, $k{=}20$, \texttt{max\_tokens=32768},
+      \texttt{enable\_prefix\_caching=False}. &
+      Same temperature; \texttt{max\_tokens=16384};
+      \texttt{enable\_prefix\_caching=True};
+      \texttt{max\_num\_seqs=64}. \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\noindent
+The \textbf{LaTeX repair} scans each question for \texttt{\$\ldots\$}
+substrings and applies 35 pattern-replacement pairs inside those regions
+only, preventing the repair from corrupting English words that share
+spellings with LaTeX commands.
+
+The \textbf{MCQ prompt} ends with: \textit{``After \texttt{</think>}, output
+EXACTLY ONE LINE and nothing else: \texttt{\textbackslash boxed\{X\}} where
+X is the single capital letter.''}
+This eliminates the most common failure mode — prose explanation after the
+think block that buries or omits the boxed answer.
+
+The \textbf{free-form prompt} uses a COUNT step that explicitly labels each
+\texttt{[ANS]} placeholder, ensuring multi-part answers are collected in
+order into a single \texttt{\textbackslash boxed\{a\_1, a\_2, \ldots\}}.
+
+The \textbf{lazy logprobs fallback} invokes a separate near-greedy pass
+(\texttt{temperature=0.01}, \texttt{logprobs=20}, \texttt{max\_tokens=10})
+with a minimal ``output only the answer letter'' prompt only for MCQs where
+the primary extractor returns an empty string.
+This keeps median latency flat while recovering answers on the small fraction
+of questions where the main response is ambiguous.
+
+
+% % % === Experiments
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Baselines}
+\label{sec:baselines}
+
+We compare against the following baselines:
+\begin{itemize}
+  \item \textbf{Starter (INT8)} -- the unmodified course-provided notebook,
+    served with BitsAndBytes INT8 quantisation and generic prompts.
+    Evaluated on the public development set as reported in milestone testing.
+
+  \item \textbf{Optimised (no quant.)} -- our final submission, served in
+    BF16 with structured prompts and robust extraction.
+    This is the configuration submitted to the private leaderboard.
+\end{itemize}
+
+\subsection{Evaluation}
+\label{sec:evaluation}
+
+MCQ predictions are scored by case-insensitive letter equality with the gold
+label.
+Free-form predictions are scored by the course-provided \texttt{Judger},
+which extracts the content of the first \texttt{\textbackslash boxed\{\}}
+expression, normalises it, and tests mathematical equivalence against each
+gold answer via SymPy-based symbolic evaluation.
+Overall accuracy is reported as total correct / total questions, with MCQ
+and free-form items weighted equally.
+The final private score comes from the Kaggle leaderboard.
+
+\subsection{Implementation Details}
+\label{sec:implementation_details}
+
+\textbf{Hardware.}
+All inference runs on a single NVIDIA A30 GPU (24~GiB VRAM).
+A full 1,116-question run takes approximately 4--6 hours, which makes
+brute-force hyperparameter sweeps impractical and motivates our focus on
+design choices with high expected return per unit of reasoning.
+
+\textbf{Model and serving.}
+The model is \texttt{Qwen/Qwen3-4B-Thinking-2507} served by vLLM~\citep{vllm}
+with \texttt{dtype="bfloat16"}, \texttt{max\_model\_len=16384},
+\texttt{gpu\_memory\_utilization=0.90}, \texttt{enable\_prefix\_caching=True},
+and \texttt{max\_num\_seqs=64}.
+We removed BitsAndBytes quantisation relative to the starter because the A30
+has sufficient VRAM to hold the 4B-parameter model in BF16
+($\approx$8~GiB weights), leaving headroom for a large KV cache.
+
+\textbf{Sampling.}
+We follow the Qwen3-Thinking recommended defaults:
+$T{=}0.6$, $p{=}0.95$, $\mathrm{top\_k}{=}20$,
+$\mathrm{repetition\_penalty}{=}1.0$, \texttt{max\_tokens=16384}.
+For the logprobs calibration fallback, we use $T{=}0.01$, $p{=}1.0$,
+\texttt{logprobs=20}, \texttt{max\_tokens=10}.
+
+\textbf{Prompts.}
+The system prompts are applied via the tokenizer's
+\texttt{apply\_chat\_template} with \texttt{add\_generation\_prompt=True};
+no few-shot examples are included.
+The MCQ prompt is 109 tokens and the free-form prompt is 127 tokens; both
+benefit from prefix caching across the batch.
+
+\textbf{Post-processing.}
+For MCQs, \texttt{extract\_letter} searches the post-\texttt{</think>}
+region first using five regex patterns (boxed letter, ``answer is X'',
+``answer: X'', ``therefore the answer is X'', ``option X is correct'')
+before falling back to option-marker heuristics.
+Questions that return an empty string trigger the logprobs calibration pass.
+For free-form, the raw response is passed directly to the \texttt{Judger}.
+
+\subsection{Results}
+\label{sec:results}
+
+\paragraph{Final leaderboard.}
+\Cref{tab:final-results} shows the key result: our optimised pipeline
+achieves \textbf{0.615} overall accuracy on the private test set, placing
+\textbf{37th out of 105 teams} (top 35\%).
+
+\begin{table}[h]
+  \caption{Final private leaderboard result.  The starter baseline is
+    approximated from small-$N$ public-set testing; only the optimised score
+    is from the official leaderboard.}
+  \label{tab:final-results}
+  \centering
+  \begin{tabular}{lcc}
+    \toprule
+    Configuration & Overall Accuracy & Leaderboard Rank \\
+    \midrule
+    Starter (INT8, generic prompts, $N{\approx}5$) & $\approx$0.60 & -- \\
+    \textbf{Optimised (BF16, structured prompts)} & \textbf{0.615} & \textbf{37 / 105} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Qualitative findings.}
+Manual inspection of model responses reveals two recurring failure patterns.
+First, about 5--10\% of free-form responses emit two or more
+\texttt{\textbackslash boxed\{\}} expressions — one inside the think block
+and one after it — causing the judger to read the inner (partial) boxed
+expression.
+Second, for multi-part questions with three or more sub-answers, the model
+occasionally switches ordering mid-response, producing a boxed tuple whose
+entries are correct but in the wrong sequence.
+Both patterns suggest that further prompt engineering — explicitly warning
+against boxed content inside \texttt{<think>} and repeating the enumeration
+order — could recover additional accuracy.
+
+
+\subsection{Ablations}
+\label{sec:ablations}
+
+Due to the 4--6 hour per-run cost on our single GPU, we did not run a full
+ablation sweep over every component in isolation.
+Instead, we developed on a frozen 100-item stratified subsample
+(75 free-form, 25 MCQ) from the public development set to test each change
+before committing to a full run.
+\Cref{tab:ablations} summarises the expected and observed contributions of
+each component.
+
+\begin{table}[h]
+  \caption{Ablation summary. ``Expected direction'' is based on failure-mode
+    analysis on the 100-item subsample.  ``Latency impact'' indicates
+    whether the change adds inference cost.}
+  \label{tab:ablations}
+  \centering
+  \footnotesize
+  \begin{tabular}{llll}
+    \toprule
+    Component & Expected direction & Latency impact & Rationale \\
+    \midrule
+    BF16 vs.\ INT8 &
+      $+$ accuracy &
+      Neutral (faster per token) &
+      Eliminates weight-rounding on precise numeric answers \\
+    Scoped LaTeX repair &
+      $+$ MCQ and free-form &
+      None &
+      Prevents garbled math notation from misleading the model \\
+    Structured MCQ prompt &
+      $+$ MCQ &
+      None (same token count) &
+      Forces single clean \texttt{\textbackslash boxed\{X\}} after \texttt{</think>} \\
+    Structured free-form prompt &
+      $+$ free-form &
+      None &
+      Forces ordered comma-separated sub-answers into one \texttt{\textbackslash boxed\{\}} \\
+    Lazy logprobs fallback &
+      $+$ MCQ (abstained) &
+      Marginal ($<$5\% of MCQs) &
+      Recovers letter when main extractor returns empty string \\
+    \texttt{enable\_prefix\_caching} &
+      $\pm$ (throughput) &
+      Reduces TTFT &
+      Amortises 100+ token shared system prompt across batch \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Of these, the switch from INT8 to BF16 and the structured MCQ prompt are the
+two changes with the highest expected return: INT8 quantisation introduces
+rounding errors that compound in multi-step arithmetic, and a poorly-formatted
+MCQ response fails extraction entirely rather than partially.
+Both changes were validated on the 100-item subsample before the final full run.
+
+
+% % % === Discussion
+\section{Discussion}
+\label{sec:discussion}
+
+Thinking models present a subtle deployment challenge: they are unusually
+sensitive to anything that prevents the final answer from surfacing.
+Token budgets that truncate the chain, extraction paths that prefer a
+no-think pass, and \texttt{stop=[\ldots]} lists that fire during reasoning all
+act as silent answer-suppressors.
+Our work addresses these failure modes at both the input and output boundaries
+without requiring any training or ensemble cost.
+
+\paragraph{Achievements.}
+Our inference-only pipeline achieves 0.615 overall accuracy on the private
+test set, ranking 37th out of 105 teams.
+All gains come from five targeted engineering decisions — BF16 serving,
+scoped LaTeX repair, structured thinking-tuned prompts, lazy logprobs
+fallback, and prefix caching — each individually motivated by a specific
+observed failure mode.
+The final pipeline is a single Python script (\texttt{run\_inference.py})
+that reproduces the submitted result in one command with no external
+dependencies beyond \texttt{vllm} and \texttt{transformers}.
+
+\paragraph{Bottlenecks and Mitigation.}
+The dominant bottleneck was decode latency: the 4--6 hour full-dataset
+runtime made iterative hyperparameter sweeps infeasible.
+We mitigated this by maintaining a 100-item stratified subsample as a fast
+evaluation proxy.
+A secondary bottleneck was the multi-boxed failure mode noted above — the
+judger reads the \emph{first} \texttt{\textbackslash boxed\{\}} expression,
+which on roughly 5--10\% of free-form responses is an intermediate result
+inside the think block rather than the final answer.
+A post-processing step that skips boxed content inside
+\texttt{<think>}\ldots\texttt{</think>} would fix this without any model
+change, but was not implemented before the submission deadline.
+
+\paragraph{Lessons Learned.}
+The most important lesson is that output-boundary failures are both common
+and easily fixable for thinking models.
+Generic prompts that do not anticipate the \texttt{<think>/</think>} format
+produce responses where the answer is technically present but
+extraction fails.
+Structured prompts with explicit post-think instructions require no extra
+computation and eliminate this failure class almost entirely.
+
+A second lesson is that precision matters for math: INT8 quantisation
+introduces compounding rounding errors on multi-step arithmetic that a
+higher-precision format avoids.
+Given sufficient VRAM, BF16 serving should be preferred for math-reasoning
+tasks even at the cost of slightly higher memory usage.
+
+Finally, a frozen evaluation subsample is essential for fast iteration on a
+budget of single-GPU hours.
+Without it, each change requires a full multi-hour run, making engineering
+feedback loops far too slow.
+
+\paragraph{Team Responsibilities.}
+Solo submission.
+Connor Wu designed and implemented the full pipeline, including LaTeX repair,
+system prompts, the logprobs fallback, the inference harness, and the
+evaluation setup.
+All experiments were run and all results were verified by the author.
+
+
+\section*{LLM Usage}
+
+Anthropic's Claude (model \texttt{claude-sonnet-4-6}, via the Claude Code
+desktop interface) was used as an interactive coding assistant with
+read/write access to this repository.
+Claude proposed and applied code changes, and drafted portions of this report
+from briefings on scope, authorship, and results.
+The author designed the overall approach, ran all experiments, verified all
+code changes, and reviewed and revised every factual claim in the report.
+The author takes full responsibility for the contents.
+
+
+\bibliography{references.bib}
+\bibliographystyle{plainnat}
+
+\end{document}
